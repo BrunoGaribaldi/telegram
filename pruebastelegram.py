@@ -93,7 +93,7 @@ def main_menu_keyboard():
 def send_main_menu(chat_id):
     send_message(
         chat_id,
-        "Menú principal:\n•Perímetro Planta\n• Lista de misiones\n• Cerrar",
+        "Menú principal:\n•mision1\n• Lista de misiones\n• Cerrar",
         reply_markup=main_menu_keyboard()
     )
 
@@ -136,26 +136,27 @@ def handle_mision1(chat_id):
                 f"Actualmente se está ejecutando la misión 'Perímetro Planta'*.\n"
                 f"Debes esperar {minutes} min {seconds} s para poder enviar otra."
             )
+            jsonsender()
             return
         else:
             mission_running = False
             current_mission_name = None
 
     # --- Envío de nueva misión ---
-    send_message(chat_id, "Iniciando misión 1 🚀")
+    send_message(chat_id, "Iniciando misión 🚀")
     try:
         # Envío real (descomentá cuando uses FlytBase)
-        # jsonsender.enviar()
+        jsonsender.enviar()
         mission_running = True
         mission_start_time = time.time()
-        current_mission_name = "Perímetro Planta"
+        current_mission_name = "mision1"
 
         send_message(chat_id, "✅ Misión *Perímetro Planta* enviada correctamente.\nNo se podrá mandar otra hasta que finalice (~10 min 13 s).")
 
     except requests.exceptions.RequestException as e:
-        send_message(chat_id, f"⚠️ Error al enviar la misión: {e}")
+        send_message(chat_id, f"⚠️ Error al enviar la misión: Porfavor contacte con soporte")
     except Exception as e:
-        send_message(chat_id, f"❌ Ocurrió un error inesperado: {e}")
+        send_message(chat_id, f"❌ Ocurrió un error inesperado: : Porfavor contacte con soporte")
 
 def handle_cerrar(chat_id):
     if is_session_active(chat_id):
