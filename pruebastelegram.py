@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import jsonsender
 
 # ================== Config ==================
-BOT_TOKEN = "8242825417:AAHS5y43tAG5KV3Btadx1Kvz7nRXvFkFyAg"
+BOT_TOKEN = ""
 URL_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
 POLL_TIMEOUT = 30          # long polling
