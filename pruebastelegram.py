@@ -81,7 +81,7 @@ def end_session(chat_id):
 def main_menu_keyboard():
     return {
         "keyboard": [
-            [{"text": "Perimetro Planta"}],
+            [{"text": "mision1"}],
             [{"text": "Lista de misiones"}],
             [{"text": "Cerrar"}],
         ],
@@ -136,7 +136,6 @@ def handle_mision1(chat_id):
                 f"Actualmente se está ejecutando la misión 'Perímetro Planta'*.\n"
                 f"Debes esperar {minutes} min {seconds} s para poder enviar otra."
             )
-            jsonsender()
             return
         else:
             mission_running = False
