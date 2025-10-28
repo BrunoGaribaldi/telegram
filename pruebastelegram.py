@@ -1,7 +1,13 @@
-import requests
-import time
 import json
+import logging
+import os
+import time
 from datetime import datetime, timedelta, timezone
+from logging.handlers import TimedRotatingFileHandler
+from typing import Any, Dict, Optional
+
+import requests
+
 import jsonsender
 
 # ================== Config ==================
@@ -12,49 +18,135 @@ POLL_TIMEOUT = 30          # long polling
 SLEEP_BETWEEN_POLLS = 2    # para no ciclar fuerte
 SESSION_TTL_SECS = 180     # ⏳ duración de la ventana (ajustá a gusto)
 
-# Duración fija de la misión (10 min 13 s)
 MISSION_DURATION = 12 * 60
-#MISSION_DURATION = 20
 mission_running = False
-mission_start_time = 0
-current_mission_name = None
+mission_start_time = 0.0
+current_mission_name: Optional[str] = None
+
+# ================== Logging ==================
+LOG_DIR = "logs"
+
+
+class MaxLevelFilter(logging.Filter):
+    def __init__(self, max_level: int):
+        super().__init__()
+        self.max_level = max_level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno <= self.max_level
+
+
+def configure_logging() -> logging.Logger:
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    logger = logging.getLogger("flytbase_bot")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
+    )
+
+    info_handler = TimedRotatingFileHandler(
+        filename=os.path.join(LOG_DIR, "operations.log"),
+        when="midnight",
+        backupCount=14,
+        encoding="utf-8",
+    )
+    info_handler.setLevel(logging.INFO)
+    info_handler.addFilter(MaxLevelFilter(logging.WARNING))
+    info_handler.setFormatter(formatter)
+
+    error_handler = TimedRotatingFileHandler(
+        filename=os.path.join(LOG_DIR, "errors.log"),
+        when="midnight",
+        backupCount=30,
+        encoding="utf-8",
+    )
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(formatter)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(formatter)
+
+    logger.addHandler(info_handler)
+    logger.addHandler(error_handler)
+    logger.addHandler(stream_handler)
+
+    return logger
+
+
+def scrub_sensitive(data: Any) -> Any:
+    """Pequeña ayuda para limitar fugas de información sensible en logs."""
+    if isinstance(data, dict):
+        return {k: ("***" if "token" in k.lower() else scrub_sensitive(v)) for k, v in data.items()}
+    if isinstance(data, list):
+        return [scrub_sensitive(item) for item in data]
+    return data
+
+
+def log_operation(message: str, **context: Any) -> None:
+    if context:
+        logger.info("%s | %s", message, json.dumps(scrub_sensitive(context), ensure_ascii=False))
+    else:
+        logger.info(message)
+
+
+def log_error(message: str, **context: Any) -> None:
+    if context:
+        logger.error("%s | %s", message, json.dumps(scrub_sensitive(context), ensure_ascii=False))
+    else:
+        logger.error(message)
+
+
+logger = configure_logging()
 
 # ================== Estado en memoria ==================
 # sessions[chat_id] = {"started_at": datetime, "expires_at": datetime, "user_name": str}
-sessions = {}
+sessions: Dict[int, Dict[str, Any]] = {}
 offset = 0  # Para no procesar mensajes viejos
 
+
 # ================== Helpers de API ==================
-def get_updates(offset):
+def get_updates(offset_value: int):
     try:
-        url = f"{URL_BASE}getUpdates?timeout={POLL_TIMEOUT}&offset={offset}"
+        url = f"{URL_BASE}getUpdates?timeout={POLL_TIMEOUT}&offset={offset_value}"
         r = requests.get(url, timeout=POLL_TIMEOUT + 5)
         r.raise_for_status()
-        return r.json().get("result", [])
+        result = r.json().get("result", [])
+        if result:
+            log_operation("Actualizaciones recibidas", total=len(result))
+        return result
     except requests.RequestException as e:
-        print(f"[get_updates] Error: {e}")
+        log_error("Error al obtener actualizaciones", error=str(e))
         return []
 
-def send_message(chat_id, text, reply_markup=None):
+
+def send_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None):
     url = f"{URL_BASE}sendMessage"
-    data = {"chat_id": chat_id, "text": text}
+    data: Dict[str, Any] = {"chat_id": chat_id, "text": text}
     if reply_markup is not None:
         data["reply_markup"] = json.dumps(reply_markup)
     try:
         r = requests.post(url, data=data, timeout=10)
         r.raise_for_status()
     except requests.RequestException as e:
-        print(f"[send_message] Error: {e}")
+        log_error("Error al enviar mensaje", chat_id=chat_id, error=str(e), payload=text)
 
-def remove_keyboard(chat_id, text="Ventana cerrada. Escribí 'hola' para empezar de nuevo."):
+
+def remove_keyboard(chat_id: int, text: str = "Ventana cerrada. Escribí 'hola' para empezar de nuevo."):
     send_message(chat_id, text, reply_markup={"remove_keyboard": True})
 
-# ================== Sesiones ==================
 
+# ================== Sesiones ==================
 def now():
     return datetime.now(timezone.utc)
 
-def is_session_active(chat_id):
+
+def is_session_active(chat_id: int) -> bool:
     s = sessions.get(chat_id)
     if not s:
         return False
@@ -63,19 +155,25 @@ def is_session_active(chat_id):
         return False
     return True
 
-def touch_session(chat_id):
+
+def touch_session(chat_id: int) -> None:
     if chat_id in sessions:
         sessions[chat_id]["expires_at"] = now() + timedelta(seconds=SESSION_TTL_SECS)
 
-def start_session(chat_id, user_name):
+
+def start_session(chat_id: int, user_name: str) -> None:
     sessions[chat_id] = {
         "started_at": now(),
         "expires_at": now() + timedelta(seconds=SESSION_TTL_SECS),
         "user_name": user_name,
     }
+    log_operation("Sesión iniciada", chat_id=chat_id, user_name=user_name)
 
-def end_session(chat_id):
-    sessions.pop(chat_id, None)
+
+def end_session(chat_id: int) -> None:
+    session = sessions.pop(chat_id, None)
+    log_operation("Sesión finalizada", chat_id=chat_id, duration_seconds=int((now() - session["started_at"]).total_seconds()) if session else None)
+
 
 # ================== UI: Menú ==================
 def main_menu_keyboard():
@@ -83,6 +181,7 @@ def main_menu_keyboard():
         "keyboard": [
             [{"text": "mision1"}],
             [{"text": "Lista de misiones"}],
+            [{"text": "Estado"}],
             [{"text": "Cerrar"}],
         ],
         "resize_keyboard": True,
@@ -90,31 +189,87 @@ def main_menu_keyboard():
         "is_persistent": True
     }
 
-def send_main_menu(chat_id):
+
+def send_main_menu(chat_id: int):
     send_message(
         chat_id,
-        "Menú principal:\n•mision1\n• Lista de misiones\n• Cerrar",
+        (
+            "Menú principal:\n"
+            "• mision1 — Inicia la misión programada.\n"
+            "• Lista de misiones — Consulta las misiones disponibles.\n"
+            "• Estado — Revisa el estado operativo del dron.\n"
+            "• Cerrar — Finaliza la sesión actual."
+        ),
         reply_markup=main_menu_keyboard()
     )
 
+
+# ================== Lógica de misiones ==================
+def update_mission_state():
+    global mission_running, mission_start_time, current_mission_name
+
+    if mission_running:
+        elapsed = time.time() - mission_start_time
+        if elapsed >= MISSION_DURATION:
+            log_operation(
+                "Misión completada por duración programada",
+                mission=current_mission_name,
+                elapsed_seconds=int(elapsed),
+            )
+            mission_running = False
+            mission_start_time = 0.0
+            current_mission_name = None
+
+
+def format_mission_status() -> str:
+    update_mission_state()
+
+    if mission_running and current_mission_name:
+        elapsed = time.time() - mission_start_time
+        remaining = max(0, int(MISSION_DURATION - elapsed))
+        minutes, seconds = divmod(remaining, 60)
+        return (
+            "🛠️ Estado operativo: EN EJECUCIÓN\n"
+            f"Misión activa: {current_mission_name}.\n"
+            f"Tiempo restante estimado: {minutes} min {seconds} s."
+        )
+
+    return "🛠️ Estado operativo: INACTIVO\nNo hay misiones en curso en este momento."
+
+
 # ================== Lógica de comandos ==================
-def handle_start_or_hola(chat_id, user_name):
+def handle_start_or_hola(chat_id: int, user_name: str):
     if is_session_active(chat_id):
         touch_session(chat_id)
-        send_message(chat_id, f"Ya tenés una ventana activa, {user_name}. Usá el menú o escribí 'cerrar' para reiniciar.")
+        send_message(chat_id, f"Ya tienes una ventana activa, {user_name}. Utiliza el menú o escribe 'cerrar' para reiniciar.")
         return
     start_session(chat_id, user_name)
-    send_message(chat_id, f"Hola, {user_name} 👋 Soy el bot de NQNPetrol. Inicié una ventana de {SESSION_TTL_SECS} segundos.")
+    send_message(
+        chat_id,
+        (
+            f"Hola, {user_name} 👋 Soy el bot operacional de NQNPetrol. "
+            f"Tienes una ventana de atención de {SESSION_TTL_SECS} segundos."
+        ),
+    )
     send_main_menu(chat_id)
 
-def handle_lista_misiones(chat_id):
+
+def handle_lista_misiones(chat_id: int):
     if not is_session_active(chat_id):
         remove_keyboard(chat_id, "Tu ventana estaba cerrada por inactividad. Escribí 'hola' para abrir una nueva.")
         return
     touch_session(chat_id)
-    send_message(chat_id, "Misiones disponibles:\n1. Perímetro Planta\n\nEscribí o tocá 'mision1'.")
+    send_message(
+        chat_id,
+        (
+            "Misiones disponibles:\n"
+            "1. Perímetro Planta — Patrulla automática del perímetro.\n\n"
+            "Selecciona la misión escribiendo o tocando 'mision1'."
+        ),
+    )
 
-def handle_mision1(chat_id):
+
+def handle_mision1(chat_id: int):
     global mission_running, mission_start_time, current_mission_name
 
     if not is_session_active(chat_id):
@@ -122,8 +277,8 @@ def handle_mision1(chat_id):
         return
 
     touch_session(chat_id)
+    update_mission_state()
 
-    # --- Control de misión activa ---
     if mission_running:
         elapsed = time.time() - mission_start_time
         remaining = int(MISSION_DURATION - elapsed)
@@ -132,43 +287,103 @@ def handle_mision1(chat_id):
             minutes, seconds = divmod(remaining, 60)
             send_message(
                 chat_id,
-                f"🚫 *Error al enviar misión.*\n"
-                f"Actualmente se está ejecutando la misión 'Perímetro Planta'*.\n"
-                f"Debes esperar {minutes} min {seconds} s para poder enviar otra."
+                (
+                    "🚫 Operación rechazada.\n"
+                    "La misión 'Perímetro Planta' continúa en progreso.\n"
+                    f"Vuelve a intentarlo en {minutes} min {seconds} s."
+                ),
+            )
+            log_operation(
+                "Intento de envío mientras misión activa",
+                chat_id=chat_id,
+                remaining_seconds=remaining,
             )
             return
-        else:
-            mission_running = False
-            current_mission_name = None
 
-    # --- Envío de nueva misión ---
-    send_message(chat_id, "Iniciando misión 🚀")
+    send_message(chat_id, "Iniciando misión programada 🚀")
     try:
-        # Envío real (descomentá cuando uses FlytBase)
-        jsonsender.enviar()
+        response = jsonsender.enviar()
         mission_running = True
         mission_start_time = time.time()
         current_mission_name = "mision1"
 
-        send_message(chat_id, "✅ Misión *Perímetro Planta* enviada correctamente.\nNo se podrá mandar otra hasta que finalice (~10 min 13 s).")
+        log_operation(
+            "Misión enviada correctamente",
+            chat_id=chat_id,
+            mission=current_mission_name,
+            response=response,
+        )
+
+        send_message(
+            chat_id,
+            (
+                "✅ Misión 'Perímetro Planta' enviada correctamente.\n"
+                "Bloqueo operativo activo hasta su finalización (~12 min)."
+            ),
+        )
 
     except requests.exceptions.RequestException as e:
-        send_message(chat_id, f"⚠️ Error al enviar la misión: Porfavor contacte con soporte")
+        log_error(
+            "Error de comunicación con FlytBase",
+            chat_id=chat_id,
+            mission="mision1",
+            error=str(e),
+        )
+        send_message(
+            chat_id,
+            (
+                "⚠️ No se pudo enviar la misión a FlytBase.\n"
+                "Nuestro equipo ya está al tanto; intenta nuevamente o contacta soporte."
+            ),
+        )
     except Exception as e:
-        send_message(chat_id, f"❌ Ocurrió un error inesperado: : Porfavor contacte con soporte")
+        log_error(
+            "Error inesperado al procesar misión",
+            chat_id=chat_id,
+            mission="mision1",
+            error=str(e),
+        )
+        send_message(
+            chat_id,
+            (
+                "❌ Se produjo un error inesperado al programar la misión.\n"
+                "Hemos registrado el incidente para su análisis."
+            ),
+        )
 
-def handle_cerrar(chat_id):
+
+def handle_estado(chat_id: int):
+    if not is_session_active(chat_id):
+        remove_keyboard(chat_id, "Tu ventana estaba cerrada por inactividad. Escribí 'hola' para abrir una nueva.")
+        return
+
+    touch_session(chat_id)
+    status_message = format_mission_status()
+    log_operation("Consulta de estado", chat_id=chat_id, status=status_message)
+    send_message(chat_id, status_message)
+
+
+def handle_cerrar(chat_id: int):
     if is_session_active(chat_id):
         end_session(chat_id)
+    log_operation("Cierre de sesión solicitado", chat_id=chat_id)
     remove_keyboard(chat_id)
 
-def handle_fallback(chat_id):
+
+def handle_fallback(chat_id: int):
     if is_session_active(chat_id):
         touch_session(chat_id)
-        send_message(chat_id, "No entendí tu mensaje 🤔 Probá con el menú.")
+        send_message(
+            chat_id,
+            (
+                "No pude interpretar el mensaje recibido.\n"
+                "Utiliza el menú para continuar o escribe 'Lista de misiones'."
+            ),
+        )
         send_main_menu(chat_id)
     else:
-        send_message(chat_id, "No hay ventana activa. Escribí 'hola' para empezar.")
+        send_message(chat_id, "No hay ventana activa. Escribe 'hola' para abrir una nueva sesión operativa.")
+
 
 # ================== Ignorar mensajes viejos ==================
 def clear_pending_updates():
@@ -181,18 +396,18 @@ def clear_pending_updates():
         data = r.json().get("result", [])
         if data:
             offset = data[-1]["update_id"] + 1
-            print(f"[Init] Ignorando {len(data)} mensajes pendientes anteriores al arranque.")
+            log_operation("Ignorando mensajes previos al arranque", total=len(data))
         else:
-            print("[Init] No hay mensajes pendientes.")
+            log_operation("No hay mensajes pendientes al inicio")
     except Exception as e:
-        print(f"[Init] Error al limpiar mensajes pendientes: {e}")
+        log_error("Error al limpiar mensajes pendientes", error=str(e))
+
 
 # ================== Loop principal ==================
 def main():
     global offset
-    print("Bot iniciado con ventanas de conversación y control de misión…")
+    log_operation("Bot iniciado con ventanas de conversación y control de misión…")
 
-    # --- 🔥 Ignorar mensajes antiguos antes de iniciar ---
     clear_pending_updates()
 
     while True:
@@ -220,12 +435,15 @@ def main():
                     handle_lista_misiones(chat_id)
                 elif lower == "mision1":
                     handle_mision1(chat_id)
+                elif lower == "estado":
+                    handle_estado(chat_id)
                 elif lower in ("cerrar", "/cerrar"):
                     handle_cerrar(chat_id)
                 else:
                     handle_fallback(chat_id)
 
         time.sleep(SLEEP_BETWEEN_POLLS)
+
 
 if __name__ == "__main__":
     main()
